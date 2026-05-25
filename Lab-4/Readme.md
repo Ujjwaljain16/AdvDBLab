@@ -1,5 +1,11 @@
 # Lab 4: SQLite B-Tree Structure Deciphered
 
+**Course:** Advanced Database Systems — Lab 4
+**Name:** Ujjwal Jain \
+**Roll Number:** 24bcs10173
+
+```LLM was used to polish and structure the content rest all the cmnds and practical was done by me ```
+
 This document details the analysis of the `my_database.db` SQLite file, using a hex dump to identify and decipher the internal B-Tree structures used by SQLite.
 
 ## 1. File Structure Overview
