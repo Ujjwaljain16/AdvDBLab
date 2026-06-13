@@ -117,11 +117,11 @@ Infix WHERE : marks >= 80 AND (age < 20 OR id = 5)
 Postfix     : marks 80 >= age 20 < id 5 = OR AND
 
 Matching rows:
-  Ujjwal Jain 10173 (id=1, age=19, marks=88)
-  Ujjwal Jain 10173 (id=5, age=21, marks=95)
+  Ishan (id=1, age=19, marks=88)
+  Dev (id=5, age=21, marks=95)
 ```
 
-`Ujjwal Jain 10173` passes (`88 >= 80` and `19 < 20`); `Ujjwal Jain 10173` passes (`95 >= 80` and `id = 5`). The same two rows the AST parser in `../queryparsing/` returns.
+`Ishan` passes (`88 >= 80` and `19 < 20`); `Dev` passes (`95 >= 80` and `id = 5`). The same two rows the AST parser in `../queryparsing/` returns.
 
 ---
 

@@ -90,11 +90,11 @@ AND
       5
 
 Matching rows:
-  Ujjwal Jain 10173
-  Ujjwal Jain 10173
+  Ishan
+  Dev
 ```
 
-The `AND` is at the root with `>=` on the left and the parenthesised `OR` on the right — exactly the precedence we wanted. `Ujjwal Jain 10173` passes because `88 >= 80` and `19 < 20`; `Ujjwal Jain 10173` passes because `95 >= 80` and `id = 5`.
+The `AND` is at the root with `>=` on the left and the parenthesised `OR` on the right — exactly the precedence we wanted. `Ishan` passes because `88 >= 80` and `19 < 20`; `Dev` passes because `95 >= 80` and `id = 5`.
 
 ---
 

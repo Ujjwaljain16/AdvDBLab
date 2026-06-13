@@ -3,7 +3,7 @@
 
 **Course:** Advanced Database Systems — Lab 2  
 **Name:** Ujjwal Jain \
-**Role Number:** 10173 \
+**Roll Number:** 24bcs10173
 **Environment:** Docker Desktop on Windows (Ubuntu 22.04 container for SQLite, postgres:15 image for PostgreSQL)
 
 ---
@@ -478,7 +478,7 @@ The score > 10 query matching 90% of the table was deliberately ignored by the i
 
 ### Architecture is the root of everything
 
-Every performance characteristic measured in this lab traces back to one fact: SQLite is a library, Postgres is a server. SQLite runs inside your process — no network, no IPC, no daemon overhead, but also no concurrency and no isolation between the database engine and the application. Postgres runs as its own process ecosystem — every connection crosses a process boundary, six daemons run continuously in the background, but in return you get MVCC, crash recovery via WAL, a cost-based query planner, and the ability to serve hundreds of clients simultaneously without any of them knowing the others exist.
+Every performance characteristic measured in this lab traces back to one fact SQLite is a library, Postgres is a server. SQLite runs inside your process no network, no IPC, no daemon overhead, but also no concurrency and no isolation between the database engine and the application. Postgres runs as its own process ecosystem every connection crosses a process boundary, six daemons run continuously in the background, but in return you get MVCC, crash recovery via WAL, a cost-based query planner, and the ability to serve hundreds of clients simultaneously without any of them knowing the others exist.
 
 ---
 
