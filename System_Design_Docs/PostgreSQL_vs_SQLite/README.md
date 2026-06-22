@@ -1,20 +1,43 @@
 # SQLite3 vs PostgreSQL — Storage Internals & Query Performance
-```LLM was used to polish and structure the content rest all the cmnds and practical was done by me ```
 
-**Name:** Ujjwal Jain \
-**Roll Number:** 24bcs10173
+**Name:** Ujjwal Jain | **Roll Number:** 24bcs10173
+
+> _LLM used to polish and structure — all commands and practical work are my own._
 
 ---
-## Environment Setup
 
-Both databases were run inside Docker containers on Windows using Docker Desktop, which handles the Linux layer transparently via WSL2.
+## 1. Problem Background
+
+### Two Databases, Two Design Philosophies
+
+SQLite and PostgreSQL are both relational databases that speak SQL. Beyond that, they're built on fundamentally different assumptions about *where the database lives* relative to the application, and *who is using it*.
+
+**SQLite** is a C library you embed directly into your process. There's no server, no daemon, no network socket. The database is a single file. The library is your database engine. This makes SQLite the right answer for mobile apps, embedded systems, local developer tooling, and anywhere you'd otherwise use a flat file but want SQL.
+
+**PostgreSQL** is a standalone server process ecosystem. Your application connects to it over a socket. Six background daemons run before your first query. It manages its own memory pool, its own WAL, its own MVCC versioning. This makes it the right answer for any workload with concurrent writers, large datasets, or the need for crash-safe durable transactions.
+
+The question this lab investigates: **what do these architectural differences actually look like when you measure them?**
+
+Specifically:
+- How do their storage internals (page/block size, caching strategy) differ?
+- What does the query planner actually do — and when does it make surprising decisions?
+- What does MVCC cost in practice, and what does VACUUM actually reclaim?
+- What does "SQLite is a library, PostgreSQL is a server" mean in observable process terms?
+
+---
+
+## 2. Architecture Overview
+
+### 2.1 Environment Setup
+
+Both databases ran inside Docker containers on Windows via Docker Desktop (WSL2 backend).
 
 ```bash
-# SQLite — plain Ubuntu container with sqlite3 installed
+# SQLite — plain Ubuntu container
 docker run -it --name sqlite-lab ubuntu:22.04 bash
 apt update && apt install -y sqlite3 wget
 
-# PostgreSQL — official image with credentials passed as env vars
+# PostgreSQL — official image
 docker run -d --name pg-lab \
   -e POSTGRES_USER=labuser \
   -e POSTGRES_PASSWORD=lab123 \
@@ -23,184 +46,51 @@ docker run -d --name pg-lab \
   postgres:15
 ```
 
-Sample database for SQLite: **Chinook** (a digital music store dataset with albums, tracks, invoices, customers).  
-For PostgreSQL: a synthetic `users` table with **50,000 rows** generated via `generate_series`.
+**SQLite dataset:** Chinook (digital music store — albums, tracks, invoices, customers). Small but real, with foreign keys and JOINs.
+
+**PostgreSQL dataset:** Synthetic `users` table — 50,000 rows generated via `generate_series`. Large enough to make index decisions meaningful.
 
 ---
 
-## Part 1 — SQLite3
+## 3. Internal Design
 
-### Dataset Overview
-
-```sql
-.tables
--- Album, Artist, Customer, Employee, Genre, Invoice, InvoiceLine, MediaType, Playlist, PlaylistTrack, Track
-
-SELECT COUNT(*) FROM Track;     -- 3503
-SELECT COUNT(*) FROM Customer;  -- 59
-SELECT COUNT(*) FROM Invoice;   -- 412
-SELECT COUNT(*) FROM Album;     -- 347
-```
-
----
-
-### Storage Internals — Pages
+### 3.1 SQLite Storage Internals
 
 ```sql
-PRAGMA page_size;
-PRAGMA page_count;
+PRAGMA page_size;    -- 4096
+PRAGMA page_count;   -- 246
 ```
 
 | Metric | Value |
-|---|---|
-| Page Size | 4096 bytes (4KB) |
-| Page Count | 246 pages |
-| Calculated Total | 4096 × 246 = **1,007,616 bytes (~984 KB)** |
+|--------|-------|
+| Page size | 4096 bytes (4KB) |
+| Page count | 246 |
+| Total DB size | 4096 × 246 = **~984 KB** |
 
-The 4KB page size is not random it exactly matches the default memory page size of the Linux kernel. SQLite aligns itself with the OS intentionally, so when the kernel loads a page into memory, it maps directly to one SQLite page with no waste.
-
----
-
-### Other PRAGMA Values
+**Why 4KB?** This exactly matches the Linux kernel's default memory page size. When the OS loads a SQLite page into memory, it maps to one kernel page — zero alignment waste. SQLite was designed for environments where matching the OS's unit of work matters. There's no shared buffer pool; SQLite relies on the OS page cache and its own configurable in-process cache.
 
 ```sql
-PRAGMA journal_mode;    -- delete
-PRAGMA cache_size;      -- -2000
-PRAGMA mmap_size;       -- 0
+PRAGMA journal_mode;   -- delete
+PRAGMA cache_size;     -- -2000
+PRAGMA mmap_size;      -- 0
 PRAGMA integrity_check; -- ok
 ```
 
-`mmap_size = 0` means memory mapping is off by default. `cache_size = -2000` means SQLite will use up to 2000 × page_size = ~8MB of in-memory page cache. `journal_mode = delete` is the classic rollback journal SQLite writes changes to a separate -journal file and deletes it on commit.
+- `cache_size = -2000` → up to 2000 × 4096 = **~8MB** of in-process page cache
+- `journal_mode = delete` → classic rollback journal; SQLite writes changes to a `-journal` file and deletes it on commit
+- `mmap_size = 0` → memory-mapped I/O off by default; the database is read via `read()` syscalls
 
----
-
-### Timing Queries — Without mmap
-
-Full table scan on `Track` (3503 rows), run three times:
-
-```bash
-time sqlite3 chinook.db "SELECT * FROM Track;"
-```
-
-| Run | real | user | sys |
-|---|---|---|---|
-| Run 1 (cold) | **37ms** | 4ms | 14ms |
-| Run 2 (warm) | **16ms** | 4ms | 12ms |
-| Run 3 (warm) | **18ms** | 17ms | 0ms |
-
-The drop from 37ms to 16ms between Run 1 and Run 2 without changing anything is the OS page cache doing its job. The database file got loaded into kernel memory on the first read, so subsequent reads never touched disk. That's purely the operating system, not SQLite.
-
----
-
-### Timing Queries — With mmap Enabled
-
-```bash
-time sqlite3 chinook.db "PRAGMA mmap_size=30000000; SELECT * FROM Track;"
-```
-
-| Run | real | user | sys |
-|---|---|---|---|
-| Run 1 | **18ms** | 9ms | 9ms |
-| Run 2 | **20ms** | 11ms | 7ms |
-| Run 3 | **14ms** | 0ms | 13ms |
-
-With `mmap` on, SQLite maps the entire database file directly into the process's virtual address space. Instead of issuing `read()` syscalls, the process accesses memory addresses that the OS backs with the file — the kernel handles page faults and caching transparently.
-
-The difference here wasn't dramatic — the Chinook database is small enough (~1MB) that it fits comfortably in the OS page cache either way. The real advantage of mmap shows up at scale: a 500MB database where repeated `read()` syscalls would accumulate meaningful overhead. On our small dataset, the times were essentially equivalent, which is itself a valid and honest observation.
-
----
-
-### Heavier Query — JOIN with Aggregation
-
-```bash
-# Without mmap
-time sqlite3 chinook.db "SELECT a.Title, COUNT(t.TrackId) as TrackCount \
-FROM Album a JOIN Track t ON a.AlbumId = t.AlbumId \
-GROUP BY a.AlbumId ORDER BY TrackCount DESC LIMIT 20;"
-
-# With mmap
-time sqlite3 chinook.db "PRAGMA mmap_size=30000000; SELECT a.Title, COUNT(t.TrackId) as TrackCount \
-FROM Album a JOIN Track t ON a.AlbumId = t.AlbumId \
-GROUP BY a.AlbumId ORDER BY TrackCount DESC LIMIT 20;"
-```
-
-| Mode | real |
-|---|---|
-| Without mmap | **3ms** |
-| With mmap | **3ms** |
-
-For a JOIN across two small, already-cached tables, the difference was negligible. At this data size the bottleneck is CPU (sorting, grouping), not I/O so mmap contributes nothing here.
-
----
-
-### SQLite Built-in Timer
-
+**Dataset sizes:**
 ```sql
-.timer on
-SELECT * FROM Track;
--- Run Time: real 0.017  user 0.004210  sys 0.013155
-
-SELECT * FROM Invoice;
--- Run Time: real 0.003  user 0.000471  sys 0.002355
-
-SELECT a.Title, COUNT(t.TrackId) FROM Album a JOIN Track t ON a.AlbumId = t.AlbumId GROUP BY a.AlbumId;
--- Run Time: real 0.003  user 0.000000  sys 0.002886
+SELECT COUNT(*) FROM Track;    -- 3503
+SELECT COUNT(*) FROM Customer; -- 59
+SELECT COUNT(*) FROM Invoice;  -- 412
+SELECT COUNT(*) FROM Album;    -- 347
 ```
-
-The higher `sys` time vs `user` time on the full Track scan shows the CPU was spending more time in kernel mode (I/O handling) than in user-space computation. For the JOIN query it flips more user time, meaning the CPU was actually computing rather than waiting on I/O.
 
 ---
 
-### Process Architecture — `ps aux`
-
-While a query was running in one terminal, I opened a second shell into the same container:
-
-```bash
-docker exec -it sqlite-lab bash
-ps aux | grep sqlite
-```
-
-```
-root  2905  0.9  0.0  6532  4608  pts/0  S+  01:07  0:02  sqlite3 chinook.db
-root  2919  0.0  0.0  3472  1792  pts/1  S+  01:12  0:00  grep --color=auto sqlite
-```
-
-Just two entries: the sqlite3 process and the grep itself. There is no SQLite server, no daemon, no background process. SQLite is a C library that gets loaded directly into whatever process invokes it. The `sqlite3` CLI is just a thin shell embedding that library. This means zero network overhead, zero IPC but also means only one writer can hold the file lock at a time.
-
----
-
-## Part 2 — PostgreSQL
-
-### Dataset Setup
-
-```sql
-CREATE TABLE users (
-    id SERIAL PRIMARY KEY,
-    name TEXT NOT NULL,
-    email TEXT NOT NULL,
-    city TEXT,
-    score FLOAT,
-    created_at TIMESTAMP DEFAULT now()
-);
-
-\timing on
-
-INSERT INTO users (name, email, city, score)
-SELECT
-    'User_' || i,
-    'user' || i || '@example.com',
-    (ARRAY['Mumbai','Delhi','Bangalore','Chennai','Hyderabad'])[1 + (i % 5)],
-    random() * 100
-FROM generate_series(1, 50000) AS s(i);
--- INSERT 0 50000
--- Time: 113.694 ms
-```
-
-50,000 rows in 113ms. That includes page allocation, WAL writes, primary key index maintenance, and buffer flushing — not just raw inserts.
-
----
-
-### Storage Internals — Blocks
+### 3.2 PostgreSQL Storage Internals
 
 ```sql
 SHOW block_size;
@@ -217,266 +107,263 @@ SELECT pg_size_pretty(pg_total_relation_size('users'));
 ```
 
 | Metric | Value |
-|---|---|
-| Block Size | 8192 bytes (8KB) |
-| Block Count | 568 blocks |
-| Calculated Size | 8192 × 568 = **4,653,056 bytes (4544 KB)** |
-| Total with Indexes + TOAST | **5696 KB** |
+|--------|-------|
+| Block size | 8192 bytes (8KB) |
+| Block count | 568 |
+| Relation size | 8192 × 568 = **4544 KB** |
+| Total (+ index + TOAST) | **5696 KB** |
 
-Postgres uses 8KB blocks double SQLite's 4KB. The larger block size makes sense for server workloads: larger fetches per I/O operation means fewer disk reads when scanning big tables. The difference between `pg_relation_size` (4544 KB) and `pg_total_relation_size` (5696 KB) is the primary key index + TOAST overhead — about 1.1MB of infrastructure cost on top of raw data.
+**Why 8KB?** PostgreSQL is built for server workloads where you have 128MB+ of shared buffers and want to minimize I/O round-trips. Larger blocks mean more data per disk read, which reduces I/O operations during table scans. The 1.15MB difference between `pg_relation_size` and `pg_total_relation_size` is the cost of the primary key index — infrastructure overhead that didn't exist in SQLite's dataset.
+
+```sql
+SHOW shared_buffers;       -- 128MB  (shared across all connections)
+SHOW work_mem;             -- 4MB    (per sort/hash operation)
+SHOW maintenance_work_mem; -- 64MB   (VACUUM, CREATE INDEX)
+SHOW effective_cache_size; -- 4GB    (planner hint: estimated OS cache)
+```
+
+`shared_buffers` is PostgreSQL's own page cache, separate from and in addition to the OS page cache. `effective_cache_size` doesn't allocate memory — it's a hint that tells the planner how much the OS is likely caching, influencing whether it prefers index scans over sequential scans.
 
 ---
 
-### Query Timings
+### 3.3 Process Architecture
 
-```sql
-\timing on
+This is the most viscerally clear illustration of the architectural difference.
 
-SELECT * FROM users LIMIT 100;
--- Time: 0.467 ms
-
-SELECT city, COUNT(*), ROUND(AVG(score)::numeric, 2) FROM users GROUP BY city;
--- Time: 10.834 ms
-
-SELECT * FROM users WHERE score > 95;
--- Time: 4.094 ms
-
-SELECT * FROM users ORDER BY score DESC LIMIT 50;
--- Time: 3.628 ms
+**SQLite — while a query runs:**
+```bash
+ps aux | grep sqlite
+# root  2905  0.9  0.0  6532  4608  pts/0  S+  sqlite3 chinook.db
+# root  2919  0.0  0.0  3472  1792  pts/1  grep sqlite
 ```
+
+Two processes: the CLI tool and the grep. No server, no daemon, no background worker. SQLite is a C library loaded into the `sqlite3` CLI process. The library *is* the database engine. Zero IPC overhead, zero network overhead — and zero concurrency beyond one writer at a time.
+
+**PostgreSQL — before any query runs:**
+```bash
+ps aux
+# postgres   1    postgres                           ← postmaster (main)
+# postgres  62    postgres: checkpointer
+# postgres  63    postgres: background writer
+# postgres  65    postgres: walwriter
+# postgres  66    postgres: autovacuum launcher
+# postgres  67    postgres: logical replication launcher
+# root       71    psql -U labuser -d labtest         ← my session
+# postgres  77    postgres: labuser labtest [local] idle
+```
+
+Six background daemons before a single query runs. Each exists for a reason directly tied to the internals covered in the PostgreSQL README:
+
+| Daemon | Why It Exists |
+|--------|--------------|
+| checkpointer | Flushes dirty pages from `shared_buffers` to disk periodically; sets WAL recovery boundary |
+| background writer | Proactively writes dirty pages so query execution isn't interrupted by I/O bursts |
+| walwriter | Flushes WAL to disk; makes `COMMIT` durable before client gets a response |
+| autovacuum launcher | Spawns workers to run VACUUM + ANALYZE; without this, dead rows accumulate forever |
+| logical replication launcher | Manages replication slots for streaming changes to replicas |
 
 ---
 
-### EXPLAIN ANALYZE — The Query Planner in Action
+## 4. Design Trade-offs
 
-#### Filter query (before index)
+### 4.1 Page Size: 4KB vs 8KB
 
-```sql
-EXPLAIN ANALYZE SELECT * FROM users WHERE score > 95;
-```
+SQLite's 4KB aligns with the Linux kernel's memory page — optimal for the OS page cache in memory-constrained embedded environments. PostgreSQL's 8KB block is optimized for server workloads: fewer I/O round-trips per scan, at the cost of more memory per cached page. Neither is wrong — they reflect different deployment contexts.
 
-```
-Seq Scan on users  (cost=0.00..1193.00 rows=2474 width=59)
-                   (actual time=0.015..4.073 rows=2507 loops=1)
-  Filter: (score > '95'::double precision)
-  Rows Removed by Filter: 47493
-Planning Time: 0.084 ms
-Execution Time: 4.187 ms
-```
+### 4.2 Caching: OS Cache vs Managed Buffer Pool
 
-Postgres scanned all 50,000 rows to find the 2,507 that passed the filter. With no index on `score`, that's the only option.
+SQLite with `mmap_size=0` relies entirely on the OS page cache — convenient but opaque. PostgreSQL's `shared_buffers` gives the database engine control over what stays in memory, allowing database-semantic decisions (pin this page, don't evict this buffer) that the OS cannot make.
 
-#### Aggregation query
+With `mmap` enabled on SQLite, the database file maps directly into the process's virtual address space. Instead of `read()` syscalls, memory accesses trigger page faults the OS handles transparently. For a ~1MB database, both approaches produce equivalent performance because the file fits in OS cache either way. The advantage of mmap materializes at scale — a 500MB database under repeated random access where syscall overhead accumulates.
 
-```sql
-EXPLAIN ANALYZE SELECT city, COUNT(*), AVG(score) FROM users GROUP BY city;
-```
+### 4.3 Concurrency: File Lock vs MVCC
 
-```
-HashAggregate  (cost=1443.00..1443.06 rows=5 width=24)
-               (actual time=12.694..12.695 rows=5 loops=1)
-  Group Key: city
-  Batches: 1  Memory Usage: 24kB
-  ->  Seq Scan on users  (actual time=0.009..2.920 rows=50000 loops=1)
-Planning Time: 0.088 ms
-Execution Time: 12.787 ms
-```
+SQLite: one writer at a time, file-level lock. Multiple readers are fine; the moment a write starts, readers must wait. For a personal app or embedded use, this is completely acceptable.
 
-Postgres chose a HashAggregate it read all rows in one pass and built a hash map keyed by city. Only 24KB of memory needed for 50,000 rows, because it was only storing 5 distinct city buckets.
+PostgreSQL: MVCC means writers create new tuple versions, readers see old versions — no blocking in either direction. This enables hundreds of concurrent connections with full isolation. The cost is dead tuples (old versions) accumulating on disk until VACUUM reclaims them.
 
-#### Sort + Limit
+### 4.4 Query Planning: Rule-Based vs Cost-Based
 
-```sql
-EXPLAIN ANALYZE SELECT * FROM users ORDER BY score DESC LIMIT 50;
-```
-
-```
-Limit  (actual time=7.415..7.419 rows=50 loops=1)
-  ->  Sort  (Sort Method: top-N heapsort  Memory: 37kB)
-      ->  Seq Scan on users  (actual time=0.008..3.044 rows=50000 loops=1)
-Planning Time: 0.062 ms
-Execution Time: 7.434 ms
-```
-
-Instead of sorting all 50,000 rows and taking the top 50, Postgres used a **top-N heapsort** maintains a heap of only 50 elements as it scans, which uses 37KB instead of megabytes.
+SQLite's planner is simpler and more rule-based. PostgreSQL's planner uses statistics from `pg_statistic` to estimate row counts, compute costs for competing plans, and choose based on estimated I/O and CPU. The consequence: PostgreSQL can make — and explain — counterintuitive decisions like *ignoring an existing index* when the math says a sequential scan is cheaper.
 
 ---
 
-### Index — Before and After
+## 5. Experiments / Observations
+
+### Experiment 1 — mmap: Does It Actually Help?
+
+```bash
+# Without mmap
+time sqlite3 chinook.db "SELECT * FROM Track;"
+# Run 1 (cold): 37ms  |  Run 2 (warm): 16ms  |  Run 3 (warm): 18ms
+
+# With mmap
+time sqlite3 chinook.db "PRAGMA mmap_size=30000000; SELECT * FROM Track;"
+# Run 1: 18ms  |  Run 2: 20ms  |  Run 3: 14ms
+```
+
+**Observation:** The cold→warm drop (37ms → 16ms) without changing anything is the OS page cache warming up. The first read loaded the ~1MB file into kernel memory; subsequent reads never touched disk. This is purely OS behavior, not SQLite.
+
+With mmap enabled, the times were essentially identical to the warm no-mmap runs. **This is a real finding.** The database is small enough to fit entirely in the OS page cache either way — mmap provides no additional benefit here. The honest conclusion: mmap's advantage requires a dataset large enough that OS cache isn't sufficient, and enough repeated random access that `read()` syscall overhead becomes measurable. Neither condition applied.
+
+```bash
+# JOIN + aggregation: no difference either way
+time sqlite3 chinook.db "SELECT a.Title, COUNT(t.TrackId) FROM Album a \
+  JOIN Track t ON a.AlbumId = t.AlbumId GROUP BY a.AlbumId ORDER BY 2 DESC LIMIT 20;"
+# Without mmap: 3ms  |  With mmap: 3ms
+```
+
+For a CPU-bound operation (sorting, grouping two small already-cached tables), I/O access method is irrelevant. The bottleneck was computation, not I/O. Confirmed by `.timer on` output:
 
 ```sql
+.timer on
+SELECT * FROM Track;
+-- real 0.017  user 0.004  sys 0.013   ← more sys than user: kernel I/O dominates
+
+SELECT a.Title, COUNT(t.TrackId) FROM Album a JOIN Track t ON a.AlbumId = t.AlbumId GROUP BY a.AlbumId;
+-- real 0.003  user 0.000  sys 0.003   ← balanced: CPU and I/O interleaved
+```
+
+High `sys` time on the full scan indicates CPU spent in kernel mode handling I/O. The JOIN query's lower total time with more balanced sys/user confirms the bottleneck shifted to user-space computation.
+
+---
+
+### Experiment 2 — PostgreSQL Query Planner: When Does an Index Get Ignored?
+
+```sql
+-- Dataset: 50,000 rows, score uniformly distributed 0–100
 CREATE INDEX idx_users_score ON users(score);
 -- Time: 44.288 ms
 ```
 
-#### Selective filter — index used
-
+**Selective filter — index used:**
 ```sql
 EXPLAIN ANALYZE SELECT * FROM users WHERE score > 95;
 ```
-
 ```
-Bitmap Heap Scan on users  (actual time=0.183..0.847 rows=2507 loops=1)
-  Recheck Cond: (score > '95'::double precision)
+Bitmap Heap Scan on users  (actual rows=2507, time=0.183..0.847ms)
   Heap Blocks: exact=563
-  ->  Bitmap Index Scan on idx_users_score  (actual time=0.132..0.133 rows=2507 loops=1)
-Planning Time: 0.136 ms
-Execution Time: 0.977 ms
+  → Bitmap Index Scan on idx_users_score  (actual rows=2507, time=0.132ms)
+Planning Time: 0.136 ms  |  Execution Time: 0.977 ms
 ```
 
-Same query: **4.187ms → 0.977ms** — roughly 4x faster. Postgres first built a bitmap of matching row locations from the index, then fetched only those 563 heap blocks.
+Same query without index: **4.187ms**. With index: **0.977ms** — ~4× faster. PostgreSQL built a bitmap of 2,507 matching row locations from the index, then fetched exactly those 563 heap blocks. No wasted I/O.
 
-#### Broad filter — index ignored (intentionally)
-
+**Broad filter — index intentionally ignored:**
 ```sql
 EXPLAIN ANALYZE SELECT * FROM users WHERE score > 10;
 ```
-
 ```
-Seq Scan on users  (actual time=0.009..5.259 rows=44974 loops=1)
+Seq Scan on users  (actual rows=44974, time=0.009..5.259ms)
   Filter: (score > '10'::double precision)
   Rows Removed by Filter: 5026
-Planning Time: 0.073 ms
 Execution Time: 6.986 ms
 ```
 
-`score > 10` matches 44,974 out of 50,000 rows (~90%). Even though the index exists, Postgres used Seq Scan. If you fetch 90% of the table, jumping between index pages and heap pages randomly causes more I/O than just reading the table sequentially. The query planner ran the math and made the right call. This was the most interesting observation of the entire lab.
+`score > 10` matches **44,974 / 50,000 rows (~90%)**. The index exists — PostgreSQL chose not to use it. **This is the most important observation in the entire lab.**
 
----
+Why? Using the index would require: read index leaf pages to find 44,974 TIDs → for each TID, fetch the corresponding heap page (potentially 44,974 random heap page accesses). Sequential scan: read 568 heap blocks in order, once. At 90% selectivity, the sequential scan's total I/O is lower than the index lookup's random I/O. PostgreSQL's cost estimator calculated both plans and chose correctly. The existence of an index does not mean PostgreSQL will use it — it means PostgreSQL will consider it.
 
-### Memory Configuration
-
+**Aggregation — HashAggregate with minimal memory:**
 ```sql
-SHOW shared_buffers;        -- 128MB
-SHOW work_mem;              -- 4MB
-SHOW maintenance_work_mem;  -- 64MB
-SHOW effective_cache_size;  -- 4GB
+EXPLAIN ANALYZE SELECT city, COUNT(*), AVG(score) FROM users GROUP BY city;
+```
+```
+HashAggregate  (actual rows=5, Memory Usage: 24kB)
+  → Seq Scan on users  (actual rows=50000)
+Execution Time: 12.787 ms
 ```
 
-`shared_buffers` is Postgres's internal page cache all connections share this pool. `work_mem` is the memory budget per sort or hash operation. `maintenance_work_mem` is for heavier ops like VACUUM and CREATE INDEX. `effective_cache_size` is a planner hint — it tells Postgres how much the OS page cache is likely holding, influencing whether it prefers index scans over seq scans.
+PostgreSQL read all 50,000 rows in one sequential pass and maintained a hash map of 5 city buckets. Total memory: 24KB. This is optimal — no sort, no intermediate materialisation, single pass.
 
----
-
-### Detailed Page Stats
-
+**Sort + Limit — top-N heapsort:**
 ```sql
-SELECT
-    relname, relpages, reltuples::bigint AS estimated_rows,
-    pg_size_pretty(relpages::bigint * 8192) AS estimated_size
-FROM pg_class WHERE relname = 'users';
+EXPLAIN ANALYZE SELECT * FROM users ORDER BY score DESC LIMIT 50;
+```
+```
+Limit  (actual rows=50)
+  → Sort  (Method: top-N heapsort, Memory: 37kB)
+      → Seq Scan on users  (actual rows=50000)
+Execution Time: 7.434 ms
 ```
 
-```
- relname | relpages | estimated_rows | estimated_size
----------+----------+----------------+----------------
- users   |      568 |          50000 | 4544 kB
-```
-
-Postgres estimated exactly 50,000 rows — accurate because stats were fresh from the insert. In practice, stats drift as data changes, which is why autovacuum also runs ANALYZE periodically.
+Rather than sorting all 50,000 rows and discarding 49,950, PostgreSQL maintained a 50-element heap during the sequential scan — O(N log k) instead of O(N log N). Memory: 37KB instead of megabytes. The planner inferred from the `LIMIT` that a full sort was unnecessary.
 
 ---
 
-### Process Architecture — `ps aux`
-
-```bash
-docker exec -it pg-lab bash
-ps aux
-```
-
-```
-postgres   1   postgres                               (main postmaster)
-postgres  62   postgres: checkpointer
-postgres  63   postgres: background writer
-postgres  65   postgres: walwriter
-postgres  66   postgres: autovacuum launcher
-postgres  67   postgres: logical replication launcher
-root       71   psql -U labuser -d labtest            (my connection)
-postgres  77   postgres: labuser labtest [local] idle
-```
-
-Six background daemons before a single query even runs. Compare this to SQLite's zero. Each daemon exists for a specific reason:
-
-- **checkpointer** — periodically flushes dirty pages from shared_buffers to disk. Without it, a crash would require replaying the entire WAL from the last checkpoint.
-- **background writer** — proactively writes dirty pages to disk ahead of checkpoints, so query execution isn't interrupted by sudden I/O bursts.
-- **walwriter** — flushes the Write-Ahead Log to disk. This is what makes `COMMIT` durable. Every committed transaction is in the WAL before the client gets a response.
-- **autovacuum launcher** — spawns worker processes to run VACUUM and ANALYZE on tables that need it. Without this, dead rows accumulate forever and performance degrades.
-- **logical replication launcher** — manages replication slots for streaming changes to replicas.
-
----
-
-### MVCC — Dead Rows in Practice
+### Experiment 3 — MVCC Dead Tuples: Making the Cost Visible
 
 ```sql
 UPDATE users SET score = score + 1 WHERE city = 'Mumbai';
 -- UPDATE 10000
 
-SELECT relname, n_live_tup, n_dead_tup, last_autovacuum
+SELECT n_live_tup, n_dead_tup, last_autovacuum
 FROM pg_stat_user_tables WHERE relname = 'users';
 ```
-
 ```
- relname | n_live_tup | n_dead_tup |        last_autovacuum
----------+------------+------------+-------------------------------
- users   |      50000 |      10000 | 2026-05-05 12:15:26.392436+00
+ n_live_tup | n_dead_tup | last_autovacuum
+------------+------------+------------------------------
+      50000 |      10000 | 2026-05-05 12:15:26+00
 ```
 
-After updating 10,000 rows, `n_dead_tup = 10000`. Postgres wrote 10,000 new row versions and marked the old ones dead — it never overwrites in place. This is what makes concurrent reads work without locking: a long-running SELECT sees the old version while an UPDATE writes the new one, because both exist on disk simultaneously.
+One UPDATE on 10,000 rows created **10,000 dead tuples** — ghost row versions on disk. PostgreSQL never overwrites in place. The old versions stay alive because a concurrent reader might still need them (MVCC snapshot isolation). `n_live_tup` stays at 50,000 because the logical row count hasn't changed; `n_dead_tup = 10000` is the physical overhead of non-destructive versioning.
 
 ```sql
 VACUUM users;
+
 SELECT n_live_tup, n_dead_tup FROM pg_stat_user_tables WHERE relname = 'users';
--- n_live_tup: 50000 | n_dead_tup: 0
+-- n_live_tup: 50000  |  n_dead_tup: 0
 ```
 
-VACUUM reclaimed all 10,000 dead row slots. If autovacuum never ran on a write-heavy table, this count would grow indefinitely — pages would fill with ghost data, scans would read useless rows, and indexes would bloat until performance collapsed.
+VACUUM reclaimed all 10,000 dead slots. If autovacuum never ran on a write-heavy table, this count would grow indefinitely — pages fill with ghost data, sequential scans read useless rows, index entries point to dead tuples, performance collapses. The autovacuum launcher daemon observed in `ps aux` exists specifically to prevent this.
+
+This experiment makes concrete what "MVCC trades storage for concurrency" actually means: 10,000 phantom rows on disk, visible in `pg_stat_user_tables`, reclaimed by an explicit `VACUUM` call.
 
 ---
 
-## Part 3 — Comparison
+## 6. Key Learnings
+
+**1. Architecture is the root cause of every measured difference.**
+SQLite's zero daemons, 4KB pages, file-level lock, and OS-managed cache all follow from "I'm a library embedded in your process." PostgreSQL's six background workers, 8KB blocks, shared buffer pool, and row-level MVCC all follow from "I'm a server managing concurrent clients." Every benchmark result in this lab traces back to this single architectural fork.
+
+**2. The OS page cache is a real database optimization layer.**
+The cold→warm timing drop (37ms → 16ms) in SQLite happened without any SQLite configuration change. The kernel warmed its own page cache after the first read. This is why "warm run" vs "cold run" distinctions matter in benchmarking — and why SQLite on a warm system can match or beat solutions with explicit caching for small datasets.
+
+**3. mmap is not universally better — dataset size determines the winner.**
+On a ~1MB database, mmap and `read()` syscalls produce identical results because the OS page cache covers both cases equally. mmap's advantage is eliminating syscall overhead at scale, where the OS cache can't hold the entire working set. Honest benchmarking means acknowledging when an optimization doesn't apply, not forcing a result.
+
+**4. A cost-based query planner's most important decisions are the ones you don't see.**
+The `score > 10` query silently ignoring its index was the most instructive moment of the lab. The planner evaluated two plans, estimated that 90% selectivity made random heap fetches more expensive than a sequential scan, and chose correctly — without being told. This is what separates a production database from a simple engine: the ability to reason about its own execution costs.
+
+**5. MVCC's cost is physically measurable.**
+10,000 dead tuples after a single UPDATE is not an abstraction — it's rows you can count in `pg_stat_user_tables`. The cost of "readers never block writers" is ghost data on disk, background cleanup processes, and the autovacuum system that keeps it from compounding. Understanding MVCC means understanding that non-destructive versioning is a storage trade-off, not a free lunch.
+
+**6. Background daemons are not overhead — they're deferred work.**
+Every PostgreSQL daemon observed in `ps aux` exists because the database defers expensive operations (page flushing, log flushing, dead tuple cleanup, statistics updates) out of the critical transaction path. The checkpointer, walwriter, and autovacuum aren't waste — they're what makes commits fast and reads consistent. SQLite avoids them by accepting their limitations: one writer, no background maintenance, no shared memory.
+
+---
+
+## Comparison Summary
 
 | Metric | SQLite3 | PostgreSQL |
-|---|---|---|
-| Page / Block Size | 4096 bytes (4KB) | 8192 bytes (8KB) |
-| Page Count | 246 pages | 568 pages |
-| Dataset | 3,503 rows (Track table) | 50,000 rows (users table) |
-| Table Size on Disk | ~984 KB (full DB) | 4544 KB (relation) / 5696 KB (total) |
-| SELECT * — cold run | 37ms | — |
-| SELECT * — warm run | 16–18ms | 0.47ms (LIMIT 100) |
-| Full table filter (no index) | ~3ms | 4.187ms |
-| Full table filter (with index) | N/A | 0.977ms |
+|--------|---------|-----------|
+| Page / block size | 4KB (OS-aligned) | 8KB (I/O-optimized) |
+| Page count (dataset) | 246 pages (~984 KB) | 568 blocks (4544 KB relation) |
+| Rows in test table | 3,503 (Track) | 50,000 (users) |
+| SELECT * cold | 37ms | — |
+| SELECT * warm | 16–18ms | 0.47ms (LIMIT 100) |
+| Full scan, no index | ~3ms | 4.187ms |
+| Full scan, with index | N/A | 0.977ms (~4× faster) |
+| Broad filter (90%), index exists | N/A | Seq scan chosen (correct) |
 | JOIN + GROUP BY | 3ms | 12.787ms |
-| Index creation time | N/A | 44.288ms |
 | INSERT 50k rows | N/A | 113.694ms |
+| Index creation | N/A | 44.288ms |
+| Dead tuples after UPDATE 10k | 0 (no MVCC) | 10,000 |
+| After VACUUM | N/A | 0 |
 | Background processes | 0 | 6 daemons |
-| Dead rows after UPDATE | No MVCC | 10,000 dead tuples |
-| Dead rows after VACUUM | N/A | 0 |
-| Memory mapping | `PRAGMA mmap_size` (manual) | `shared_buffers` (automatic, 128MB) |
-| Max concurrent writers | 1 (file-level lock) | Many (row-level MVCC) |
-| Architecture | In-process library | Client-server (separate process) |
-
----
-
-## Analysis
-
-### Why the page size difference makes sense
-
-SQLite's 4KB page aligns with the OS memory page built for embedded environments where memory is tight and alignment with the kernel's unit of work matters most. Postgres's 8KB block is a deliberate trade-off for server workloads: larger blocks mean fewer I/O operations per table scan, and when you have 128MB of shared_buffers anyway, the extra memory cost per block is irrelevant.
-
-### mmap: when it helps and when it doesn't
-
-The honest result from the mmap experiment: on a ~1MB database, it barely made a difference. The OS page cache already keeps the file warm after the first read, with or without mmap. Where mmap would actually matter is at scale a database too large to fit in the OS page cache, accessed frequently enough that individual read() syscalls accumulate into real overhead. For our dataset, both approaches hit the same ceiling: the file fit in memory either way. That's a real finding, not a failure of the experiment.
-
-### The index decision Postgres made correctly
-
-The score > 10 query matching 90% of the table was deliberately ignored by the index and that is the right call. Random I/O (jumping between index leaf pages and heap pages) is slower than sequential I/O (reading the table block by block) when the result set is large. Postgres's query planner estimated the cost of both plans using table statistics and chose the cheaper one. This kind of cost-based reasoning doesn't exist at the same level in SQLite — it has a simpler rule-based planner.
-
-### MVCC overhead is the price of concurrency
-
-10,000 dead rows from a single UPDATE is a lot of ghost data on disk. But that is the cost of MVCC: readers never block writers and writers never block readers, because old versions stay alive until no active transaction needs them anymore. SQLite avoids this overhead entirely but the trade-off is one writer at a time, always. For a personal app: totally fine. For any backend with concurrent writes: not viable.
-
-### Architecture is the root of everything
-
-Every performance characteristic measured in this lab traces back to one fact SQLite is a library, Postgres is a server. SQLite runs inside your process no network, no IPC, no daemon overhead, but also no concurrency and no isolation between the database engine and the application. Postgres runs as its own process ecosystem every connection crosses a process boundary, six daemons run continuously in the background, but in return you get MVCC, crash recovery via WAL, a cost-based query planner, and the ability to serve hundreds of clients simultaneously without any of them knowing the others exist.
+| Max concurrent writers | 1 (file lock) | Many (row-level MVCC) |
+| Buffer cache | OS page cache + PRAGMA | `shared_buffers` (128MB default) |
+| Architecture | In-process library | Client-server process ecosystem |
 
 ---
 
@@ -500,15 +387,16 @@ ps aux | grep sqlite
 # PostgreSQL
 docker exec -it pg-lab psql -U labuser -d labtest
 SHOW block_size;
+SHOW shared_buffers;
+SHOW work_mem;
+SHOW effective_cache_size;
 SELECT relpages FROM pg_class WHERE relname = 'users';
 SELECT pg_size_pretty(pg_relation_size('users'));
 SELECT pg_size_pretty(pg_total_relation_size('users'));
 \timing on
 EXPLAIN ANALYZE SELECT ...;
 CREATE INDEX idx_users_score ON users(score);
-SHOW shared_buffers;
-SHOW work_mem;
-SELECT n_live_tup, n_dead_tup FROM pg_stat_user_tables WHERE relname = 'users';
+SELECT n_live_tup, n_dead_tup, last_autovacuum FROM pg_stat_user_tables WHERE relname = 'users';
 VACUUM users;
 ps aux
 ```
